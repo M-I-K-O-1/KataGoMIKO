@@ -72,8 +72,11 @@ SearchParams::SearchParams()
    enablePassingHacks(false),
    enableMorePassingHacks(false),
    alwaysComputePassAliveUnderSuicideRules(enabled_t::Auto),
+   excludeTerritoryAdjacentToAtari(enabled_t::Auto),
    playoutDoublingAdvantage(0.0),
    playoutDoublingAdvantagePla(C_EMPTY),
+   visitCapContempt(0),
+   visitCapContemptPla(C_EMPTY),
    avoidRepeatedPatternUtility(0.0),
    nnPolicyTemperature(1.0f),
    antiMirror(false),
@@ -201,9 +204,13 @@ bool SearchParams::operator==(const SearchParams& other) const {
     enablePassingHacks == other.enablePassingHacks &&
     enableMorePassingHacks == other.enableMorePassingHacks &&
     alwaysComputePassAliveUnderSuicideRules == other.alwaysComputePassAliveUnderSuicideRules &&
+    excludeTerritoryAdjacentToAtari == other.excludeTerritoryAdjacentToAtari &&
 
     playoutDoublingAdvantage == other.playoutDoublingAdvantage &&
     playoutDoublingAdvantagePla == other.playoutDoublingAdvantagePla &&
+
+    visitCapContempt == other.visitCapContempt &&
+    visitCapContemptPla == other.visitCapContemptPla &&
 
     avoidRepeatedPatternUtility == other.avoidRepeatedPatternUtility &&
 
@@ -457,10 +464,14 @@ json SearchParams::changeableParametersToJson() const {
   ret["enablePassingHacks"] = enablePassingHacks;
   ret["enableMorePassingHacks"] = enableMorePassingHacks;
   ret["alwaysComputePassAliveUnderSuicideRules"] = alwaysComputePassAliveUnderSuicideRules.toString();
+  ret["excludeTerritoryAdjacentToAtari"] = excludeTerritoryAdjacentToAtari.toString();
 
   // Special handling in GTP
   ret["playoutDoublingAdvantage"] = playoutDoublingAdvantage;
   ret["playoutDoublingAdvantagePla"] = PlayerIO::playerToStringShort(playoutDoublingAdvantagePla);
+
+  ret["visitCapContempt"] = visitCapContempt;
+  ret["visitCapContemptPla"] = PlayerIO::playerToStringShort(visitCapContemptPla);
 
   // Special handling in GTP
   // ret["avoidRepeatedPatternUtility"] = avoidRepeatedPatternUtility;
@@ -636,14 +647,18 @@ void SearchParams::printParams(std::ostream& out) const {
   PRINTPARAM(rootPruneUselessMoves);
   PRINTPARAM(conservativePass);
   PRINTPARAM(fillDameBeforePass);
-  std::cout << "avoidMYTDaggerHackPla" << ": " << (int)avoidMYTDaggerHackPla << std::endl;
+  out << "avoidMYTDaggerHackPla" << ": " << (int)avoidMYTDaggerHackPla << std::endl;
   PRINTPARAM(wideRootNoise);
   PRINTPARAM(enablePassingHacks);
   PRINTPARAM(enableMorePassingHacks);
   out << "alwaysComputePassAliveUnderSuicideRules: " << alwaysComputePassAliveUnderSuicideRules.toString() << std::endl;
+  out << "excludeTerritoryAdjacentToAtari: " << excludeTerritoryAdjacentToAtari.toString() << std::endl;
 
   PRINTPARAM(playoutDoublingAdvantage);
-  std::cout << "playoutDoublingAdvantagePla" << ": " << (int)playoutDoublingAdvantagePla << std::endl;
+  out << "playoutDoublingAdvantagePla" << ": " << (int)playoutDoublingAdvantagePla << std::endl;
+
+  PRINTPARAM(visitCapContempt);
+  out << "visitCapContemptPla" << ": " << (int)visitCapContemptPla << std::endl;
 
   PRINTPARAM(avoidRepeatedPatternUtility);
 

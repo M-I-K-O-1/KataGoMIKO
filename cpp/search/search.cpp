@@ -76,6 +76,7 @@ Search::Search(const SearchParams& params, NNEvaluator* nnEval, NNEvaluator* hum
    rootGraphHash(),
    rootHintLoc(Board::NULL_LOC),
    avoidMoveUntilByLocBlack(),avoidMoveUntilByLocWhite(),avoidMoveUntilRescaleRoot(false),
+   rootFocus(nullptr),rootFocusCleanupMutex(),rootFocusToCleanUp(),
    rootSymmetries(),
    rootPruneOnlySymmetries(),
    rootSafeArea(NULL),
@@ -86,6 +87,7 @@ Search::Search(const SearchParams& params, NNEvaluator* nnEval, NNEvaluator* hum
    alwaysIncludeOwnerMap(false),
    searchParams(params),numSearchesBegun(0),searchNodeAge(0),
    plaThatSearchIsFor(C_EMPTY),plaThatSearchIsForLastSearch(C_EMPTY),
+   visitCapForBlack(0),visitCapForWhite(0),
    lastSearchNumPlayouts(0),
    effectiveSearchTimeCarriedOver(0.0),
    randSeed(rSeed),
@@ -141,13 +143,15 @@ Search::Search(const SearchParams& params, NNEvaluator* nnEval, NNEvaluator* hum
   mutexPool = new MutexPool(nodeTable->mutexPool->getNumMutexes());
 
   rootHistory.clear(rootBoard,rootPla,Rules(),0);
-  applyPassAliveModeToRootHistory();
+  applyHistoryModesToRootHistory();
   rootKoHashTable->recompute(rootHistory);
 }
 
 Search::~Search() {
   clearSearch();
 
+  cleanUpOldRootFocus();
+  delete rootFocus.load(std::memory_order_acquire);
   delete[] rootSafeArea;
   delete rootKoHashTable;
   delete valueWeightDistribution;
@@ -173,6 +177,12 @@ Player Search::getPlayoutDoublingAdvantagePla() const {
   return searchParams.playoutDoublingAdvantagePla == C_EMPTY ? plaThatSearchIsFor : searchParams.playoutDoublingAdvantagePla;
 }
 
+Player Search::getVisitCappedPla() const {
+  if(searchParams.visitCapContempt <= 0)
+    return C_EMPTY;
+  return searchParams.visitCapContemptPla == C_EMPTY ? getOpp(plaThatSearchIsFor) : searchParams.visitCapContemptPla;
+}
+
 bool Search::resolveAlwaysComputePassAliveUnderSuicideRules(const SearchParams& params, const NNEvaluator* nnEval) {
   if(params.alwaysComputePassAliveUnderSuicideRules == enabled_t::True)
     return true;
@@ -181,12 +191,27 @@ bool Search::resolveAlwaysComputePassAliveUnderSuicideRules(const SearchParams& 
   return nnEval != NULL && nnEval->modelPreferPassAliveUnderSuicideRules();
 }
 
-void Search::applyPassAliveModeToRootHistory() {
-  bool b = resolveAlwaysComputePassAliveUnderSuicideRules(searchParams, nnEvaluator);
-  if(rootHistory.alwaysComputePassAliveUnderSuicideRules != b) {
-    //Changing the mode changes graph hashes and in-tree adjudication, so no search state can be kept.
+bool Search::resolveExcludeTerritoryAdjacentToAtari(const SearchParams& params, const NNEvaluator* nnEval) {
+  if(params.excludeTerritoryAdjacentToAtari == enabled_t::True)
+    return true;
+  if(params.excludeTerritoryAdjacentToAtari == enabled_t::False)
+    return false;
+  return nnEval != NULL && nnEval->modelPreferExcludeTerritoryAdjacentToAtari();
+}
+
+BoardHistoryModes Search::resolveHistoryModes(const SearchParams& params, const NNEvaluator* nnEval) {
+  return BoardHistoryModes(
+    resolveAlwaysComputePassAliveUnderSuicideRules(params, nnEval),
+    resolveExcludeTerritoryAdjacentToAtari(params, nnEval)
+  );
+}
+
+void Search::applyHistoryModesToRootHistory() {
+  BoardHistoryModes m = resolveHistoryModes(searchParams, nnEvaluator);
+  if(rootHistory.modes != m) {
+    //Changing the modes changes graph hashes and in-tree adjudication, so no search state can be kept.
     clearSearch();
-    rootHistory.setAlwaysComputePassAliveUnderSuicideRules(b);
+    rootHistory.setModes(m);
   }
 }
 
@@ -196,10 +221,11 @@ void Search::setPosition(Player pla, const Board& board, const BoardHistory& his
   plaThatSearchIsFor = C_EMPTY;
   rootBoard = board;
   rootHistory = history;
-  applyPassAliveModeToRootHistory();
+  applyHistoryModesToRootHistory();
   rootKoHashTable->recompute(rootHistory);
   avoidMoveUntilByLocBlack.clear();
   avoidMoveUntilByLocWhite.clear();
+  setRootFocus(std::vector<Loc>(), std::vector<double>(), 0.0);
 }
 
 void Search::setPlayerAndClearHistory(Player pla) {
@@ -212,7 +238,7 @@ void Search::setPlayerAndClearHistory(Player pla) {
   bool assumeMultipleStartingBlackMovesAreHandicap = rootHistory.assumeMultipleStartingBlackMovesAreHandicap;
   rootHistory.clear(rootBoard,rootPla,rules,rootHistory.encorePhase);
   rootHistory.setAssumeMultipleStartingBlackMovesAreHandicap(assumeMultipleStartingBlackMovesAreHandicap);
-  applyPassAliveModeToRootHistory();
+  applyHistoryModesToRootHistory();
 
   rootKoHashTable->recompute(rootHistory);
 
@@ -233,7 +259,7 @@ void Search::setKomiIfNew(float newKomi) {
     clearSearch();
     rootHistory.setKomi(newKomi);
   }
-  applyPassAliveModeToRootHistory();
+  applyHistoryModesToRootHistory();
 }
 
 void Search::setAvoidMoveUntilByLoc(const std::vector<int>& bVec, const std::vector<int>& wVec) {
@@ -246,6 +272,35 @@ void Search::setAvoidMoveUntilByLoc(const std::vector<int>& bVec, const std::vec
 
 void Search::setAvoidMoveUntilRescaleRoot(bool b) {
   avoidMoveUntilRescaleRoot = b;
+}
+
+void Search::setRootFocus(const std::vector<Loc>& moves, const std::vector<double>& weights, double prob) {
+  assert(moves.size() == weights.size());
+  //No need to clear the search. Focus only changes which child is selected by playouts from the root,
+  //so an existing tree remains valid.
+  FocusMoves* newFocus = nullptr;
+  if(moves.size() > 0 && prob > 0.0) {
+    newFocus = new FocusMoves();
+    newFocus->moves = moves;
+    newFocus->weights = weights;
+    for(size_t i = 0; i<newFocus->weights.size(); i++)
+      newFocus->weights[i] = std::min(newFocus->weights[i], MAX_ROOT_FOCUS_WEIGHT);
+    newFocus->prob = std::min(prob, MAX_ROOT_FOCUS_PROB);
+  }
+  //Search threads may still be using the old struct, so defer freeing it until no search is running.
+  FocusMoves* oldFocus = rootFocus.exchange(newFocus, std::memory_order_acq_rel);
+  if(oldFocus != nullptr) {
+    std::lock_guard<std::mutex> lock(rootFocusCleanupMutex);
+    rootFocusToCleanUp.push_back(oldFocus);
+  }
+}
+
+//Must not be called while a search is running.
+void Search::cleanUpOldRootFocus() {
+  std::lock_guard<std::mutex> lock(rootFocusCleanupMutex);
+  for(FocusMoves* focus: rootFocusToCleanUp)
+    delete focus;
+  rootFocusToCleanUp.clear();
 }
 
 void Search::setRootHintLoc(Loc loc) {
@@ -273,14 +328,14 @@ void Search::setRootSymmetryPruningOnly(const std::vector<int>& v) {
 void Search::setParams(const SearchParams& params) {
   clearSearch();
   searchParams = params;
-  applyPassAliveModeToRootHistory();
+  applyHistoryModesToRootHistory();
 }
 
 void Search::setParamsNoClearing(const SearchParams& params) {
   searchParams = params;
   //Deliberately overrides the "no clearing" if the resolved pass-alive mode actually changes,
   //since in that case no search state is valid to keep.
-  applyPassAliveModeToRootHistory();
+  applyHistoryModesToRootHistory();
 }
 
 void Search::setExternalPatternBonusTable(std::unique_ptr<PatternBonusTable>&& table) {
@@ -316,7 +371,7 @@ void Search::setNNEval(NNEvaluator* nnEval) {
     if(humanEvaluator->getNNXLen() != nnXLen || humanEvaluator->getNNYLen() != nnYLen)
       throw StringError("Search::setNNEval - humanEval has different nnXLen or nnYLen");
   }
-  applyPassAliveModeToRootHistory();
+  applyHistoryModesToRootHistory();
 }
 
 void Search::clearSearch() {
@@ -416,9 +471,10 @@ bool Search::makeMove(Loc moveLoc, Player movePla, bool preventEncore) {
     }
   }
 
-  //Explicitly clear avoid move arrays when we play a move - user needs to respecify them if they want them.
+  //Explicitly clear avoid move arrays and focus moves when we play a move - user needs to respecify them if they want them.
   avoidMoveUntilByLocBlack.clear();
   avoidMoveUntilByLocWhite.clear();
+  setRootFocus(std::vector<Loc>(), std::vector<double>(), 0.0);
 
   //If we're newly inferring some moves as handicap that we weren't before, clear since score will be wrong.
   if(rootHistory.whiteHandicapBonusScore != oldWhiteHandicapBonusScore)
@@ -641,6 +697,9 @@ void Search::runWholeSearch(
 
   //Relaxed load is fine since numPlayoutsShared should be synchronized already due to the joins
   lastSearchNumPlayouts = numPlayoutsShared.load(std::memory_order_relaxed);
+
+  //No search threads are running any more, so focus structs replaced during the search can be freed.
+  cleanUpOldRootFocus();
   effectiveSearchTimeCarriedOver += timer.getSeconds() - actualSearchStartTime;
 }
 
@@ -654,10 +713,7 @@ void Search::beginSearch(bool pondering) {
 
   //Invariant: every setter that installs or rebuilds rootHistory or changes params/nnEvaluator
   //re-stamps this flag, so it should always be consistent by the time a search begins.
-  testAssert(
-    rootHistory.alwaysComputePassAliveUnderSuicideRules ==
-    resolveAlwaysComputePassAliveUnderSuicideRules(searchParams, nnEvaluator)
-  );
+  testAssert(rootHistory.modes == resolveHistoryModes(searchParams, nnEvaluator));
 
   rootBoard.checkConsistency();
 
@@ -694,6 +750,8 @@ void Search::beginSearch(bool pondering) {
   }
   plaThatSearchIsForLastSearch = plaThatSearchIsFor;
   //cout << "BEGINSEARCH " << PlayerIO::playerToString(rootPla) << " " << PlayerIO::playerToString(plaThatSearchIsFor) << endl;
+
+  applyVisitCapsForSearch();
 
   clearOldNNOutputs();
   computeRootValues();
@@ -740,6 +798,8 @@ void Search::beginSearch(bool pondering) {
     rootSymmetries.push_back(0);
   }
 
+  computeRootSymRepresentativeLocs();
+
   SearchThread dummyThread(-1, *this);
 
   //If we're using graph search, we recompute the graph hash from scratch at the start of search.
@@ -750,8 +810,12 @@ void Search::beginSearch(bool pondering) {
 
   //Precompute the params hash once per search (params are constant during a search) so it can be cheaply
   //folded into every eval cache lookup, keeping cached search results from leaking across different params.
-  if(searchParams.useEvalCache && searchParams.useGraphSearch)
+  if(searchParams.useEvalCache && searchParams.useGraphSearch) {
     evalCacheParamsHash = searchParams.getHash();
+    //Which player is capped can depend on plaThatSearchIsFor, which the params hash does not cover.
+    if(visitCapForBlack != 0 || visitCapForWhite != 0)
+      evalCacheParamsHash ^= Hash128(Hash::murmurMix((uint64_t)visitCapForBlack), Hash::murmurMix((uint64_t)visitCapForWhite + 0x9E3779B97F4A7C15ULL));
+  }
   else
     evalCacheParamsHash = Hash128();
 
@@ -1107,6 +1171,26 @@ void Search::recursivelyRecordEvalCache(SearchNode& n) {
   applyRecursivelyPostOrderMulithreaded(nodes,&f);
 }
 
+
+//The caps are tracked by color rather than relative to the root player, so that a tree built while pondering
+//stays valid for the following search on our own turn, and vice versa.
+void Search::applyVisitCapsForSearch() {
+  if(searchParams.visitCapContempt == 1 || searchParams.visitCapContempt < 0)
+    throw StringError("visitCapContempt must be 0 or at least 2");
+  int64_t newVisitCapForBlack = 0;
+  int64_t newVisitCapForWhite = 0;
+  Player cappedPla = getVisitCappedPla();
+  if(cappedPla == P_BLACK)
+    newVisitCapForBlack = searchParams.visitCapContempt;
+  else if(cappedPla == P_WHITE)
+    newVisitCapForWhite = searchParams.visitCapContempt;
+
+  if(newVisitCapForBlack != visitCapForBlack || newVisitCapForWhite != visitCapForWhite) {
+    clearSearch();
+    visitCapForBlack = newVisitCapForBlack;
+    visitCapForWhite = newVisitCapForWhite;
+  }
+}
 
 void Search::computeRootValues() {
   //rootSafeArea is strictly pass-alive groups and strictly safe territory.

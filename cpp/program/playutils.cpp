@@ -185,9 +185,11 @@ Loc PlayUtils::getGameInitializationMove(
   MiscNNInputParams nnInputParams;
   nnInputParams.drawEquivalentWinsForWhite = searcher->searchParams.drawEquivalentWinsForWhite;
   //Featurize for this bot's net the way that bot's own searches would, even if the game-level history
-  //carries a different pass-alive computation mode.
+  //carries different BoardHistoryModes.
   nnInputParams.passAliveSuicideRulesOverride =
     Search::resolveAlwaysComputePassAliveUnderSuicideRules(searcher->searchParams, nnEval) ? 1 : 0;
+  nnInputParams.excludeTerritoryAdjAtariOverride =
+    Search::resolveExcludeTerritoryAdjacentToAtari(searcher->searchParams, nnEval) ? 1 : 0;
   nnEval->evaluate(board,hist,pla,nnInputParams,buf,false,false);
   std::shared_ptr<NNOutput> nnOutput = std::move(buf.result);
 
@@ -282,11 +284,13 @@ void PlayUtils::playExtraBlack(
   if(!hist.isGameFinished) {
     NNResultBuf buf;
     bool botPassAliveMode = Search::resolveAlwaysComputePassAliveUnderSuicideRules(bot->searchParams, bot->nnEvaluator);
+    bool botExcludeTerritoryAdjAtari = Search::resolveExcludeTerritoryAdjacentToAtari(bot->searchParams, bot->nnEvaluator);
     for(int i = 0; i<numExtraBlack; i++) {
       MiscNNInputParams nnInputParams;
       nnInputParams.drawEquivalentWinsForWhite = bot->searchParams.drawEquivalentWinsForWhite;
       //Featurize the way this bot's own searches would, even if the passed history differs.
       nnInputParams.passAliveSuicideRulesOverride = botPassAliveMode ? 1 : 0;
+      nnInputParams.excludeTerritoryAdjAtariOverride = botExcludeTerritoryAdjAtari ? 1 : 0;
       bot->nnEvaluator->evaluate(board,hist,pla,nnInputParams,buf,false,false);
       std::shared_ptr<NNOutput> nnOutput = std::move(buf.result);
 
@@ -705,6 +709,7 @@ vector<double> PlayUtils::computeOwnership(
   SearchParams newParams = getNoiselessParams(oldParams,numVisits);
   newParams.playoutDoublingAdvantagePla = C_EMPTY;
   newParams.playoutDoublingAdvantage = 0.0;
+  newParams.visitCapContempt = 0;
   //Make sure the search is always from a state where the game isn't believed to end with another pass
   newParams.conservativePass = true;
 
@@ -964,7 +969,7 @@ PlayUtils::BenchmarkResults PlayUtils::benchmarkSearchOnPositionsAndPrint(
   Board board;
   Player nextPla;
   BoardHistory hist;
-  sgf.setupInitialBoardAndHist(initialRules, board, nextPla, hist, Search::resolveAlwaysComputePassAliveUnderSuicideRules(params, nnEval));
+  sgf.setupInitialBoardAndHist(initialRules, board, nextPla, hist, Search::resolveHistoryModes(params, nnEval));
 
   int moveNum = 0;
 
@@ -1019,7 +1024,8 @@ void PlayUtils::printGenmoveLog(
   Loc moveLoc,
   double timeTaken,
   Player perspective,
-  bool logSearchInfoForChosenMove
+  bool logSearchInfoForChosenMove,
+  const PrintTreeOptions& treeOptions
 ) {
   const Board& board = search->getRootBoard();
   Board::printBoard(out, board, moveLoc, &(search->getRootHist().moveHistory));
@@ -1035,14 +1041,17 @@ void PlayUtils::printGenmoveLog(
     out << "PlayoutDoublingAdvantage: " << (
       search->getRootPla() == getOpp(search->getPlayoutDoublingAdvantagePla()) ?
       -search->searchParams.playoutDoublingAdvantage : search->searchParams.playoutDoublingAdvantage) << endl;
+  if(search->searchParams.visitCapContempt > 0)
+    out << "VisitCapContempt: " << search->searchParams.visitCapContempt
+        << " (capped player " << PlayerIO::playerToString(search->getVisitCappedPla()) << ")" << endl;
   out << "PV: ";
   search->printPV(out, search->rootNode, 25);
   out << "\n";
   out << "Tree:\n";
   if(logSearchInfoForChosenMove && moveLoc != Board::NULL_LOC)
-    search->printTree(out, search->rootNode, PrintTreeOptions().maxDepth(1).maxChildrenToShow(10).alsoBranch(board,{Location::toString(moveLoc,board)}),perspective);
+    search->printTree(out, search->rootNode, treeOptions.alsoBranch(board,{Location::toString(moveLoc,board)}),perspective);
   else
-    search->printTree(out, search->rootNode, PrintTreeOptions().maxDepth(1).maxChildrenToShow(10),perspective);
+    search->printTree(out, search->rootNode, treeOptions,perspective);
 }
 
 Rules PlayUtils::genRandomRules(Rand& rand) {
@@ -1195,6 +1204,7 @@ Loc PlayUtils::maybeFriendlyPass(
     SearchParams newParams = getNoiselessParams(oldParams,numVisits);
     newParams.playoutDoublingAdvantagePla = C_EMPTY;
     newParams.playoutDoublingAdvantage = 0.0;
+    newParams.visitCapContempt = 0;
     //Conservative pass makes sure we evaluate the opponent's turn as one in which the game is neither finished nor the opponent
     //will be able to end the game via passing.
     newParams.conservativePass = true;
